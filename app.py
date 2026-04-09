@@ -1,7 +1,7 @@
 """
 Moms & Afgifter Radar
 =====================
-Streamlit dashboard der henter de seneste nyheder om moms og afgifter
+Streamlit-dashboard der henter de seneste nyheder om moms og afgifter
 fra officielle danske og EU-kilder.
 
 Kør med:  streamlit run app.py
@@ -9,10 +9,16 @@ Kør med:  streamlit run app.py
 
 import streamlit as st
 import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-import re
+import feedparser
+from datetime import datetime
 import json
+import re
+
+try:
+    from duckduckgo_search import DDGS
+    DDG_OK = True
+except ImportError:
+    DDG_OK = False
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -37,50 +43,54 @@ HEADERS = {
 
 CACHE_TTL = 3600  # 1 time
 
+
 # ---------------------------------------------------------------------------
 # Hjælpefunktioner
 # ---------------------------------------------------------------------------
 
 def clean_text(text: str) -> str:
-    """Fjern overflødige whitespaces og linjeskift."""
     if not text:
         return ""
     return re.sub(r"\s+", " ", text).strip()
 
 
-def format_date(raw: str) -> str:
-    """Forsøg at parse og reformatere en dato til DD.MM.ÅÅÅÅ."""
-    if not raw:
-        return ""
-    raw = raw.strip()
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(raw[:len(fmt)], fmt).strftime("%d.%m.%Y")
-        except ValueError:
-            pass
-    return raw
-
-
-def safe_get(url: str, timeout: int = 15, **kwargs) -> requests.Response | None:
-    """Hent URL med fejlhåndtering."""
+def safe_get(url: str, timeout: int = 15, **kwargs):
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout, **kwargs)
         r.raise_for_status()
         return r
-    except requests.RequestException as e:
+    except requests.RequestException:
         return None
 
 
+def ddg_soeg(query: str, max_results: int = 8) -> list[dict]:
+    """Søg via DuckDuckGo – kræver duckduckgo-search pakken."""
+    if not DDG_OK:
+        return [{"fejl": "duckduckgo-search er ikke installeret. Kør: pip install duckduckgo-search"}]
+    try:
+        with DDGS() as ddgs:
+            resultater = []
+            for r in ddgs.text(query, max_results=max_results):
+                resultater.append({
+                    "titel": r.get("title", "Uden titel"),
+                    "dato": "",
+                    "url": r.get("href", ""),
+                    "resume": clean_text(r.get("body", ""))[:200],
+                })
+            return resultater if resultater else [{"fejl": f"Ingen resultater fundet."}]
+    except Exception as e:
+        return [{"fejl": f"DuckDuckGo søgefejl: {e}"}]
+
+
 # ---------------------------------------------------------------------------
-# Scrapers – én funktion pr. kilde
+# Scrapers
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def hent_folketing() -> list[dict]:
     """
-    Folketing Open Data API (ODA).
-    Henter lovforslag der indeholder 'moms' i titel eller resume,
-    sorteret efter seneste opdatering.
+    Folketing Open Data API (ODA) – officiel REST API, meget stabil.
+    Docs: https://oda.ft.dk/api/
     """
     url = (
         "https://oda.ft.dk/api/Sag"
@@ -96,252 +106,195 @@ def hent_folketing() -> list[dict]:
 
     try:
         data = r.json()
-    except json.JSONDecodeError:
-        return [{"fejl": "Ugyldigt JSON fra Folketing API."}]
+    except Exception:
+        return [{"fejl": "Ugyldigt svar fra Folketing API."}]
 
     resultater = []
     for item in data.get("value", []):
         sagsnr = item.get("Nummer", "")
-        periode = item.get("Samling", {})
-        periode_id = periode.get("Id", "") if isinstance(periode, dict) else ""
+        samling = item.get("Samling", {})
+        samlings_id = samling.get("Id", "") if isinstance(samling, dict) else ""
         ft_url = (
-            f"https://www.ft.dk/samling/{periode_id}/lovforslag/l{sagsnr}/index.htm"
-            if sagsnr and periode_id
-            else "https://www.ft.dk"
+            f"https://www.ft.dk/samling/{samlings_id}/lovforslag/l{sagsnr}/index.htm"
+            if sagsnr and samlings_id
+            else "https://www.ft.dk/da/dokumenter/dokumentlister/lovforslag"
         )
+        dato_raw = item.get("Opdateringsdato", "")
+        dato = dato_raw[:10] if dato_raw else ""
         resultater.append({
             "titel": clean_text(item.get("Titel", "Uden titel")),
-            "dato": format_date(item.get("Opdateringsdato", "")),
+            "dato": dato,
             "url": ft_url,
-            "resume": clean_text(item.get("Resume", ""))[:300],
-            "status": item.get("StatusId", ""),
+            "resume": clean_text(item.get("Resume", ""))[:250],
         })
+
     return resultater if resultater else [{"fejl": "Ingen lovforslag fundet."}]
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def hent_lovtidende() -> list[dict]:
+def hent_retsinformation() -> list[dict]:
     """
-    Lovtidende.dk – søg efter dokumenter med 'moms'.
-    Siden er HTML-baseret og pagineret.
+    Retsinformation.dk – finder love og bekendtgørelser om moms.
+    Forsøger den officielle API og falder tilbage til tredjeparts-API.
     """
-    url = "https://www.lovtidende.dk/documents?o=40&t=%2Amoms%2A"
+    # Officiel Retsinformation API
+    url = (
+        "https://www.retsinformation.dk/api/document"
+        "?search=moms&documentType=LOV,BEK,CIR,VEJ&pageSize=10"
+    )
     r = safe_get(url)
+
     if r is None:
-        return [{"fejl": "Kunne ikke hente data fra Lovtidende.dk."}]
+        # Tredjeparts wrapper API
+        url = "https://retsinformation-api.dk/v1/lovgivning/?search=moms&limit=10"
+        r = safe_get(url)
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    if r is None:
+        return [{"fejl": "Kunne ikke hente data fra Retsinformation."}]
+
+    try:
+        data = r.json()
+    except Exception:
+        return [{"fejl": "Ugyldigt svar fra Retsinformation API."}]
+
     resultater = []
+    items = data if isinstance(data, list) else data.get("results", data.get("value", []))
 
-    # Lovtidende viser resultater i en tabel eller liste – prøv begge mønstre
-    rows = soup.select("table tbody tr") or soup.select("ul.document-list li")
-
-    for row in rows[:10]:
-        cols = row.find_all("td")
-        if cols and len(cols) >= 2:
-            link_tag = row.find("a", href=True)
-            titel = clean_text(link_tag.get_text() if link_tag else cols[0].get_text())
-            href = link_tag["href"] if link_tag else ""
-            full_url = ("https://www.lovtidende.dk" + href) if href.startswith("/") else href
-            dato_text = clean_text(cols[1].get_text()) if len(cols) > 1 else ""
+    for item in items[:10]:
+        titel = (
+            item.get("title") or item.get("Titel") or
+            item.get("name") or item.get("shortTitle") or "Uden titel"
+        )
+        dato = (
+            item.get("publishedDate") or item.get("Dato") or
+            item.get("updated") or item.get("date") or ""
+        )
+        if dato:
+            dato = dato[:10]
+        item_url = item.get("url") or item.get("Uri") or item.get("link") or ""
+        if item_url and not item_url.startswith("http"):
+            item_url = "https://www.retsinformation.dk" + item_url
+        resume = clean_text(
+            item.get("abstract") or item.get("Resume") or item.get("description") or ""
+        )[:200]
+        if titel and titel != "Uden titel":
             resultater.append({
-                "titel": titel,
-                "dato": dato_text,
-                "url": full_url,
-                "resume": "",
+                "titel": clean_text(titel),
+                "dato": dato,
+                "url": item_url,
+                "resume": resume,
             })
-        else:
-            # Prøv list-item mønster
-            link_tag = row.find("a", href=True)
-            if link_tag:
-                href = link_tag["href"]
-                full_url = ("https://www.lovtidende.dk" + href) if href.startswith("/") else href
-                dato_tag = row.find(class_=re.compile(r"date|dato", re.I))
-                resultater.append({
-                    "titel": clean_text(link_tag.get_text()),
-                    "dato": clean_text(dato_tag.get_text()) if dato_tag else "",
-                    "url": full_url,
-                    "resume": "",
-                })
 
-    return resultater if resultater else [{"fejl": "Ingen resultater fundet på Lovtidende.dk – siden kan have ændret struktur."}]
+    return resultater if resultater else [{"fejl": "Ingen resultater fra Retsinformation."}]
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def hent_skat(oid: str, label: str) -> list[dict]:
+def hent_skat_styresignaler() -> list[dict]:
     """
-    info.skat.dk – generisk scraper til skat.dk-sider.
-    oid=16010  → styresignaler
-    oid=124    → afgørelser og domme
-    oid=74288  → vejledninger og satser
+    Nyeste styresignaler om moms via DuckDuckGo.
+    (info.skat.dk er JavaScript-renderet og kan ikke scrapes direkte)
     """
-    url = f"https://info.skat.dk/data.aspx?oid={oid}"
-    r = safe_get(url)
-    if r is None:
-        return [{"fejl": f"Kunne ikke hente data fra skat.dk ({label})."}]
+    return ddg_soeg(
+        'site:info.skat.dk styresignal moms afgifter 2025 OR 2026',
+        max_results=8,
+    )
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    resultater = []
 
-    # skat.dk bruger typisk en tabel med klassen "table" eller en liste med links
-    links = soup.select("table.table tr") or soup.select(".documentlist li") or soup.select("ul li")
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def hent_skat_afgoerelser() -> list[dict]:
+    """
+    Nyeste afgørelser og domme om moms via DuckDuckGo.
+    """
+    return ddg_soeg(
+        'site:info.skat.dk SKM2025 OR SKM2026 moms '
+        'Landsskatteretten OR Skatterådet OR Højesteret OR Landsret',
+        max_results=8,
+    )
 
-    for row in links[:15]:
-        link_tag = row.find("a", href=True)
-        if not link_tag:
-            continue
-        href = link_tag["href"]
-        if href.startswith("/"):
-            href = "https://info.skat.dk" + href
-        elif not href.startswith("http"):
-            href = "https://info.skat.dk/" + href
 
-        dato_tag = row.find(class_=re.compile(r"date|dato|published", re.I))
-        dato = ""
-        if dato_tag:
-            dato = clean_text(dato_tag.get_text())
-        else:
-            # Prøv at finde en dato-lignende streng i rækken
-            dato_match = re.search(r"\d{2}[.\-/]\d{2}[.\-/]\d{2,4}", row.get_text())
-            if dato_match:
-                dato = dato_match.group()
-
-        titel = clean_text(link_tag.get_text())
-        if titel:
-            resultater.append({
-                "titel": titel,
-                "dato": dato,
-                "url": href,
-                "resume": "",
-            })
-
-    return resultater if resultater else [{"fejl": f"Ingen resultater fundet for {label}."}]
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def hent_skat_vejledninger() -> list[dict]:
+    """
+    Nyeste vejledningsopdateringer om moms via DuckDuckGo.
+    """
+    return ddg_soeg(
+        'site:info.skat.dk "Den juridiske vejledning" moms 2025 OR 2026',
+        max_results=8,
+    )
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def hent_hoeringsporten() -> list[dict]:
     """
-    Høringsporten – høringer fra Skatteministeriet.
+    Officielle Atom-feeds fra Høringsporten:
+    - Skatteministeriet (authorityId=613)
+    - SKAT (authorityId=643)
+    - Skatter og afgifter (formAreaId=15)
+    Disse feeds er stabile og kræver ingen JS-rendering.
     """
-    url = "https://hoeringsportalen.dk/Hearing?Authorities=Skatteministeriet"
-    r = safe_get(url)
-    if r is None:
-        return [{"fejl": "Kunne ikke hente data fra Høringsporten."}]
+    feeds = [
+        "https://hoeringsportalen.dk/Syndication/HearingsByAuthorityFeed?authorityId=613",
+        "https://hoeringsportalen.dk/Syndication/HearingsByAuthorityFeed?authorityId=643",
+        "https://hoeringsportalen.dk/Syndication/HearingsByFormAreaFeed?formAreaId=15",
+    ]
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    seen = set()
     resultater = []
 
-    # Høringsporten viser høringer i kort-layout
-    cards = (
-        soup.select(".hearing-list-item")
-        or soup.select("article.card")
-        or soup.select(".hearing-item")
-        or soup.select("li.list-group-item")
-    )
+    for feed_url in feeds:
+        try:
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries:
+                titel = clean_text(entry.get("title", "Uden titel"))
+                if titel in seen:
+                    continue
+                seen.add(titel)
 
-    for card in cards[:10]:
-        link_tag = card.find("a", href=True)
-        if not link_tag:
+                link = entry.get("link", "")
+                dato = ""
+                if entry.get("published_parsed"):
+                    dato = datetime(*entry.published_parsed[:3]).strftime("%d.%m.%Y")
+                elif entry.get("updated_parsed"):
+                    dato = datetime(*entry.updated_parsed[:3]).strftime("%d.%m.%Y")
+
+                resume = clean_text(re.sub(r"<[^>]+>", "", entry.get("summary", "")))[:250]
+
+                resultater.append({
+                    "titel": titel,
+                    "dato": dato,
+                    "url": link,
+                    "resume": resume,
+                })
+        except Exception:
             continue
-        href = link_tag["href"]
-        full_url = ("https://hoeringsportalen.dk" + href) if href.startswith("/") else href
 
-        titel = clean_text(link_tag.get_text())
-        if not titel:
-            h_tag = card.find(["h2", "h3", "h4"])
-            titel = clean_text(h_tag.get_text()) if h_tag else "Uden titel"
-
-        dato_tag = card.find(class_=re.compile(r"date|dato|deadline|frist", re.I))
-        if not dato_tag:
-            dato_tag = card.find("time")
-        dato = clean_text(dato_tag.get_text()) if dato_tag else ""
-
-        frist_match = re.search(r"[Ff]rist[:\s]+(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})", card.get_text())
-        frist = frist_match.group(1) if frist_match else ""
-
-        if titel:
-            resultater.append({
-                "titel": titel,
-                "dato": dato,
-                "url": full_url,
-                "resume": f"Høringsfrist: {frist}" if frist else "",
-            })
-
-    return resultater if resultater else [{"fejl": "Ingen høringer fundet fra Skatteministeriet."}]
+    resultater.sort(key=lambda x: x.get("dato", ""), reverse=True)
+    return resultater[:15] if resultater else [{"fejl": "Ingen høringer fundet i Atom-feed."}]
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def hent_eu_domme() -> list[dict]:
     """
-    EU-Domstolen – domme om moms (VAT/merværdiafgift) via EUR-Lex SPARQL/search.
-    Bruger EUR-Lex søge-API som er mere stabilt end CURIA direkte.
+    EU-momsdomme via DuckDuckGo (CURIA og EUR-Lex er JS-renderede).
     """
-    # EUR-Lex full-text søgning – nyeste momsdomme
-    url = (
-        "https://eur-lex.europa.eu/search.html"
-        "?scope=EURLEX&text=VAT+value+added+tax"
-        "&lang=da&type=quick&qid=1&DD_YEAR=2024"
-        "&DTS_DOM=EU_LAW"
-        "&typeOfActStatus=CASE_LAW"
+    resultater = ddg_soeg(
+        'site:curia.europa.eu merværdiafgift OR moms dom 2025 OR 2026',
+        max_results=6,
     )
-    r = safe_get(url)
-    if r is None:
-        # Fallback: CURIA søgeside
-        curia_url = (
-            "https://curia.europa.eu/juris/liste.jsf"
-            "?language=da&jur=C,T&num=&dates=&docnodecision=0"
-            "&allcommjo=0&affint=0&affclose=0&alldocrec=0"
-            "&docdecision=1&docor=1&docav=0&docsom=0"
-            "&docinf=0&alldocord=0&docord=0&ray=0&nat=0"
-            "&otherint=0&resc=0&reson=0&resmin=0&doctyp=0"
-            "&domainInt=0&mots=TVA+merv%C3%A6rdiafgift&resmax=10"
-        )
-        r = safe_get(curia_url)
-        if r is None:
-            return [{"fejl": "Kunne ikke hente domme fra EU-Domstolen eller EUR-Lex."}]
+    if resultater and "fejl" not in resultater[0]:
+        return resultater
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    resultater = []
-
-    # EUR-Lex resultater
-    rows = (
-        soup.select(".SearchResult")
-        or soup.select("table.table tr")
-        or soup.select(".result-item")
-        or soup.select("li.result")
+    return ddg_soeg(
+        'site:eur-lex.europa.eu moms merværdiafgift dom Danmark 2025 OR 2026',
+        max_results=6,
     )
-
-    for row in rows[:10]:
-        link_tag = row.find("a", href=True)
-        if not link_tag:
-            continue
-        href = link_tag["href"]
-        if href.startswith("/"):
-            href = "https://eur-lex.europa.eu" + href
-        elif "curia" in href or href.startswith("/"):
-            href = "https://curia.europa.eu" + href
-
-        titel = clean_text(link_tag.get_text())
-        dato_tag = row.find(class_=re.compile(r"date|dato", re.I)) or row.find("time")
-        dato = clean_text(dato_tag.get_text()) if dato_tag else ""
-
-        if titel:
-            resultater.append({
-                "titel": titel,
-                "dato": dato,
-                "url": href,
-                "resume": "",
-            })
-
-    return resultater if resultater else [{"fejl": "Ingen EU-domme fundet – siden kan have ændret struktur."}]
 
 
 # ---------------------------------------------------------------------------
-# UI – hjælpefunktioner
+# UI-komponenter
 # ---------------------------------------------------------------------------
 
 def vis_resultater(resultater: list[dict], kilde_url: str):
-    """Vis en liste af resultater som Streamlit-komponenter."""
     for item in resultater:
         if "fejl" in item:
             st.warning(f"⚠️ {item['fejl']}")
@@ -353,34 +306,28 @@ def vis_resultater(resultater: list[dict], kilde_url: str):
         dato = item.get("dato", "")
         resume = item.get("resume", "")
 
-        with st.container():
-            col1, col2 = st.columns([5, 1])
-            with col1:
-                if url:
-                    st.markdown(f"**[{titel}]({url})**")
-                else:
-                    st.markdown(f"**{titel}**")
-                if resume:
-                    st.caption(resume)
-            with col2:
-                if dato:
-                    st.caption(dato)
-            st.divider()
+        col1, col2 = st.columns([6, 1])
+        with col1:
+            if url:
+                st.markdown(f"**[{titel}]({url})**")
+            else:
+                st.markdown(f"**{titel}**")
+            if resume:
+                st.caption(resume)
+        with col2:
+            if dato:
+                st.caption(dato)
+        st.divider()
 
 
 def kilde_sektion(titel: str, ikon: str, kilde_url: str, fetch_fn, *args):
-    """
-    Viser én kildekort med overskrift, hent-knap og resultater.
-    Bruger st.session_state til at gemme resultater på tværs af genindlæsninger.
-    """
-    key = f"data_{titel.replace(' ', '_')}"
-    key_ts = f"ts_{titel.replace(' ', '_')}"
+    key = f"data_{re.sub(r'[^a-zA-Z0-9]', '_', titel)}"
+    key_ts = f"ts_{re.sub(r'[^a-zA-Z0-9]', '_', titel)}"
 
     with st.expander(f"{ikon}  {titel}", expanded=True):
-        col_header, col_btn, col_link = st.columns([4, 1, 1])
+        col_btn, col_link = st.columns([1, 1])
         with col_btn:
             if st.button("🔄 Hent", key=f"btn_{key}"):
-                # Ryd cache for denne funktion og hent på ny
                 fetch_fn.clear()
                 with st.spinner("Henter…"):
                     st.session_state[key] = fetch_fn(*args)
@@ -398,39 +345,81 @@ def kilde_sektion(titel: str, ikon: str, kilde_url: str, fetch_fn, *args):
 
 
 # ---------------------------------------------------------------------------
-# Hent-alle funktion
+# Kildekatalog
 # ---------------------------------------------------------------------------
 
-def hent_alle():
-    """Kald alle scrapers og gem i session_state."""
-    opgaver = [
-        ("data_Lovforslag_–_Folketing", "ts_Lovforslag_–_Folketing", hent_folketing),
-        ("data_Bekendtgørelser_–_Lovtidende", "ts_Bekendtgørelser_–_Lovtidende", hent_lovtidende),
-        ("data_Styresignaler_–_Skattestyrelsen", "ts_Styresignaler_–_Skattestyrelsen",
-         lambda: hent_skat("16010", "Styresignaler")),
-        ("data_Afgørelser_&_domme_–_Skattestyrelsen", "ts_Afgørelser_&_domme_–_Skattestyrelsen",
-         lambda: hent_skat("124", "Afgørelser")),
-        ("data_Vejledninger_&_satser_–_Skattestyrelsen", "ts_Vejledninger_&_satser_–_Skattestyrelsen",
-         lambda: hent_skat("74288", "Vejledninger")),
-        ("data_Høringer_–_Skatteministeriet", "ts_Høringer_–_Skatteministeriet", hent_hoeringsporten),
-        ("data_EU-domme_–_EU-Domstolen", "ts_EU-domme_–_EU-Domstolen", hent_eu_domme),
-    ]
+ALLE_KILDER = {
+    "Lovforslag – Folketing": {
+        "ikon": "🏛️",
+        "url": "https://www.ft.dk/da/dokumenter/dokumentlister/lovforslag?numberOfDays=-93&searchText=*moms*",
+        "fn": hent_folketing,
+        "args": (),
+        "kategori": "dk",
+    },
+    "Love & bekendtgørelser – Retsinformation": {
+        "ikon": "📜",
+        "url": "https://www.retsinformation.dk/",
+        "fn": hent_retsinformation,
+        "args": (),
+        "kategori": "dk",
+    },
+    "Styresignaler – Skattestyrelsen": {
+        "ikon": "📢",
+        "url": "https://info.skat.dk/data.aspx?oid=16010",
+        "fn": hent_skat_styresignaler,
+        "args": (),
+        "kategori": "dk",
+    },
+    "Afgørelser & domme – Skattestyrelsen": {
+        "ikon": "⚖️",
+        "url": "https://info.skat.dk/data.aspx?oid=124",
+        "fn": hent_skat_afgoerelser,
+        "args": (),
+        "kategori": "dk",
+    },
+    "Vejledninger – Den Juridiske Vejledning": {
+        "ikon": "📖",
+        "url": "https://info.skat.dk/data.aspx?oid=74288",
+        "fn": hent_skat_vejledninger,
+        "args": (),
+        "kategori": "dk",
+    },
+    "Høringer – Skatteministeriet": {
+        "ikon": "📬",
+        "url": "https://hoeringsportalen.dk/Hearing?Authorities=Skatteministeriet",
+        "fn": hent_hoeringsporten,
+        "args": (),
+        "kategori": "hearing",
+    },
+    "EU-domme – EU-Domstolen": {
+        "ikon": "🇪🇺",
+        "url": "https://curia.europa.eu/juris/recherche.jsf?language=da",
+        "fn": hent_eu_domme,
+        "args": (),
+        "kategori": "eu",
+    },
+}
+
+
+def hent_alle(valgte_kategorier: list[str]):
     ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-    progress = st.progress(0, text="Henter alle kilder…")
-    for i, (key, key_ts, fn) in enumerate(opgaver):
+    filtrerede = [
+        (t, c) for t, c in ALLE_KILDER.items()
+        if "alle" in valgte_kategorier or c["kategori"] in valgte_kategorier
+    ]
+    bar = st.progress(0, text="Henter alle kilder…")
+    for i, (titel, cfg) in enumerate(filtrerede):
+        key = f"data_{re.sub(r'[^a-zA-Z0-9]', '_', titel)}"
+        key_ts = f"ts_{re.sub(r'[^a-zA-Z0-9]', '_', titel)}"
         try:
-            # Ryd cache
-            try:
-                fn.__wrapped__.clear() if hasattr(fn, "__wrapped__") else None
-            except Exception:
-                pass
-            st.session_state[key] = fn()
+            cfg["fn"].clear()
+            st.session_state[key] = cfg["fn"](*cfg["args"])
             st.session_state[key_ts] = ts
         except Exception as e:
             st.session_state[key] = [{"fejl": str(e)}]
             st.session_state[key_ts] = ts
-        progress.progress((i + 1) / len(opgaver), text=f"Henter… ({i+1}/{len(opgaver)})")
-    progress.empty()
+        bar.progress((i + 1) / len(filtrerede), text=f"Henter… ({i+1}/{len(filtrerede)})")
+    bar.empty()
 
 
 # ---------------------------------------------------------------------------
@@ -439,89 +428,41 @@ def hent_alle():
 
 st.title("⚖️ Moms & Afgifter Radar")
 st.caption(
-    "Nyhedsoverblik til tax professionals · "
+    "Nyhedsoverblik for tax professionals · "
     "Henter direkte fra officielle danske og EU-kilder"
 )
 
-# Topbar
-col_all, col_filter, col_info = st.columns([2, 4, 2])
-with col_all:
-    if st.button("🔄 Opdater alle kilder", type="primary", use_container_width=True):
-        hent_alle()
-        st.rerun()
-
-with col_filter:
-    valgte = st.multiselect(
-        "Filtrer kategorier",
-        options=["Lovforslag", "Lovtidende", "Styresignaler", "Afgørelser", "Vejledninger", "Høringer", "EU-domme"],
-        default=["Lovforslag", "Lovtidende", "Styresignaler", "Afgørelser", "Vejledninger", "Høringer", "EU-domme"],
-        label_visibility="collapsed",
+if not DDG_OK:
+    st.warning(
+        "⚠️ **duckduckgo-search** er ikke installeret — "
+        "skat.dk-søgninger og EU-domme virker ikke. "
+        "Installér med: `pip install duckduckgo-search`"
     )
 
-with col_info:
+col_all, col_filter, col_ts = st.columns([2, 4, 2])
+
+with col_filter:
+    kat_labels = {"alle": "Alle", "dk": "Dansk ret", "hearing": "Høringer", "eu": "EU"}
+    valgte = st.multiselect(
+        "Kategorier",
+        options=list(kat_labels.keys()),
+        default=["alle"],
+        format_func=lambda x: kat_labels[x],
+        label_visibility="collapsed",
+    )
+    if not valgte:
+        valgte = ["alle"]
+
+with col_all:
+    if st.button("🔄 Opdater alle", type="primary", use_container_width=True):
+        hent_alle(valgte)
+        st.rerun()
+
+with col_ts:
     st.caption(f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
 st.divider()
 
-# Kildekorte
-ALLE_KILDER = {
-    "Lovforslag": {
-        "titel": "Lovforslag – Folketing",
-        "ikon": "🏛️",
-        "url": "https://www.ft.dk/da/dokumenter/dokumentlister/lovforslag?numberOfDays=-93&searchText=*moms*",
-        "fn": hent_folketing,
-        "args": (),
-    },
-    "Lovtidende": {
-        "titel": "Bekendtgørelser – Lovtidende",
-        "ikon": "📜",
-        "url": "https://www.lovtidende.dk/documents?o=40&t=%2Amoms%2A",
-        "fn": hent_lovtidende,
-        "args": (),
-    },
-    "Styresignaler": {
-        "titel": "Styresignaler – Skattestyrelsen",
-        "ikon": "📢",
-        "url": "https://info.skat.dk/data.aspx?oid=16010",
-        "fn": hent_skat,
-        "args": ("16010", "Styresignaler"),
-    },
-    "Afgørelser": {
-        "titel": "Afgørelser & domme – Skattestyrelsen",
-        "ikon": "⚖️",
-        "url": "https://info.skat.dk/data.aspx?oid=124",
-        "fn": hent_skat,
-        "args": ("124", "Afgørelser"),
-    },
-    "Vejledninger": {
-        "titel": "Vejledninger & satser – Skattestyrelsen",
-        "ikon": "📖",
-        "url": "https://info.skat.dk/data.aspx?oid=74288",
-        "fn": hent_skat,
-        "args": ("74288", "Vejledninger"),
-    },
-    "Høringer": {
-        "titel": "Høringer – Skatteministeriet",
-        "ikon": "📬",
-        "url": "https://hoeringsportalen.dk/Hearing?Authorities=Skatteministeriet",
-        "fn": hent_hoeringsporten,
-        "args": (),
-    },
-    "EU-domme": {
-        "titel": "EU-domme – EU-Domstolen",
-        "ikon": "🇪🇺",
-        "url": "https://juris.curia.europa.eu/juris/recherche.jsf?language=da",
-        "fn": hent_eu_domme,
-        "args": (),
-    },
-}
-
-for kategori, cfg in ALLE_KILDER.items():
-    if kategori in valgte:
-        kilde_sektion(
-            cfg["titel"],
-            cfg["ikon"],
-            cfg["url"],
-            cfg["fn"],
-            *cfg["args"],
-        )
+for titel, cfg in ALLE_KILDER.items():
+    if "alle" in valgte or cfg["kategori"] in valgte:
+        kilde_sektion(titel, cfg["ikon"], cfg["url"], cfg["fn"], *cfg["args"])
